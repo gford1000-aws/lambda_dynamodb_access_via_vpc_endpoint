@@ -1,0 +1,224 @@
+{
+    "AWSTemplateFormatVersion": "2010-09-09",
+    "Description": "Creates a VPC with DynamoDB endpoint, showing Lambda in VPC can reach DynamoDB without internet access",
+    "Parameters" : {
+        "CidrAddress" : {
+            "Default" : "10.0",
+            "Description" : "Initial two values for CIDR address for the VPC, which will be expanded X.Y.0.0/16",
+            "Type" : "String",
+            "MinLength" : "3",
+            "MaxLength" : "7",
+            "AllowedPattern" : "[0-9]?[0-9]?[0-9]\\.[0-9]?[0-9]?[0-9]",
+            "ConstraintDescription" : "Must create a valid CIDR"
+        },
+        "PrivateSubnetCount" : {
+            "Default" : "3",
+            "Description" : "Number of private subnets to create in the VPC",
+            "Type" : "Number",
+            "AllowedValues" : ["2","3","4","5","6"],
+            "ConstraintDescription" : "Must be between 2 and 6"
+        },
+        "DDBEndpointPrefixList" : {
+            "Description" : "The prefix list 'pl-xxxxxxx' value for DynamoDB in the deployment region.  Use 'aws ec2 describe-prefix-lists'",
+            "Type" : "String"
+        },
+        "VPCTemplateURL" : {
+            "Description" : "The URL to the template to create the VPC (see https://github.com/gford1000-aws/vpc/blob/master/create_vpc.cform)",
+            "Type" : "String"
+        } 
+	},
+	"Resources" : {
+        "VPC" : {
+            "Type" : "AWS::CloudFormation::Stack",
+            "Properties" : {
+                "Parameters" : {
+                    "CidrAddress" : { "Ref" : "CidrAddress" },
+                    "CreatePublicSubnet" : "false",
+                    "EnableDnsSupport" : "true",
+                    "PrivateSubnetCount" : { "Ref" : "PrivateSubnetCount" }
+                },
+                "TemplateURL" : { "Ref" : "VPCTemplateURL" }
+            }
+        },
+        "DynamoDBEndpoint" : {
+            "Type" : "AWS::EC2::VPCEndpoint",
+            "Properties" : {
+                "PolicyDocument" : {
+                    "Version":"2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect" : "Allow",
+                            "Principal" : "*",
+                            "Action" : "*",
+                            "Resource": [ { "Fn::Sub": [ "arn:aws:dynamodb:${Region}:${Account}:table/${TableName}", 
+                                            { 
+                                                "Region": { "Ref" : "AWS::Region" }, 
+                                                "Account": { "Ref" : "AWS::AccountId" }, 
+                                                "TableName" : { "Ref" : "DynamoDBTable" }
+                                            } 
+                                        ] } 
+                            ] 
+                        }
+                    ]
+                },
+                "RouteTableIds" : [ { "Fn::GetAtt" : [ "VPC", "Outputs.PrivateSubnetRouteTable" ] } ],
+                "ServiceName" : { "Fn::Sub" : [ "com.amazonaws.${Region}.dynamodb", { "Region" : { "Ref" : "AWS::Region" } } ] },
+                "VpcId" : { "Fn::GetAtt" : [ "VPC", "Outputs.VPC" ] }
+            }
+        },
+        "DynamoDBTable" : {
+            "Type" : "AWS::DynamoDB::Table",
+            "Properties" : {
+                "AttributeDefinitions" : [
+                    {
+                        "AttributeName" : "Id",
+                        "AttributeType" : "S"
+                    }
+                ],
+                "KeySchema" : [ 
+                    {
+                        "AttributeName" : "Id",
+                        "KeyType" : "HASH"
+                    }
+                ],
+                "ProvisionedThroughput" : {
+                    "ReadCapacityUnits" : "5",
+                    "WriteCapacityUnits" : "5"
+                }
+            }
+        },
+        "LambdaDDBWrite" : {
+            "Type": "AWS::Lambda::Function",
+            "DependsOn" : "VPC",
+            "Properties" : {
+                "Code" : {
+                    "ZipFile" : {
+                        "Fn::Join": [
+                            "\n",
+                            [
+                                "import boto3",
+                                "import os",
+                                "from uuid import uuid4",
+                                "",
+                                "TABLE_NAME = os.environ['TableName']",
+                                "",
+                                "def lambda_handler(event, context):",
+                                "    client = boto3.client('dynamodb')",
+                                "    resp = client.update_item(",
+                                "       TableName=TABLE_NAME,",
+                                "       Key={ \"Id\" : { \"S\" : str(uuid4()) } },",
+                                "       UpdateExpression=\"SET #C=:myText\",",
+                                "       ExpressionAttributeNames={ \"#C\" : \"Comment\" },",
+                                "       ExpressionAttributeValues={ \":myText\" : { \"S\" : \"Hello World!\" } })",
+                                "    print(resp)",
+                                ""
+                            ]
+                        ]
+                    }
+                },
+                "Description" : "Lambda demonstrating DynamoDB access via VPC Endpoint",
+                "Environment" : {
+                    "Variables" : {
+                        "TableName" : { "Ref": "DynamoDBTable" }
+                    }
+                },
+                "Handler" : "index.lambda_handler",
+                "MemorySize" : 128,
+                "Role" : { "Fn::GetAtt": [ "LambdaRole", "Arn" ] },
+                "Runtime" : "python2.7",
+                "Timeout" : 5,
+                "VpcConfig" : {
+                    "SecurityGroupIds" : [ { "Ref" : "LambdaSecurityGroup" }],
+                    "SubnetIds" : { "Fn::Split" : [ ",", { "Fn::GetAtt" : [ "VPC", "Outputs.PrivateSubnets" ] } ] }
+                }
+            }
+        },
+        "LambdaSecurityGroup" : {
+            "Type" : "AWS::EC2::SecurityGroup",
+            "Properties" : {
+                "GroupDescription" : "Security Group for Lambda Egress",
+                "VpcId" : { "Fn::GetAtt" : [ "VPC", "Outputs.VPC" ] },
+                "SecurityGroupEgress" : [
+                    {
+                        "DestinationPrefixListId" : { "Ref" : "DDBEndpointPrefixList" },
+                        "IpProtocol" : "-1" 
+                    }
+                ]
+            }
+        },
+        "LambdaRole": {
+          "Type": "AWS::IAM::Role",
+          "Properties": {
+            "AssumeRolePolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Principal": {
+                    "Service": "lambda.amazonaws.com"
+                  },
+                  "Action": "sts:AssumeRole"
+                }
+              ]
+            },
+            "Path": "/",
+            "Policies": [
+              {
+                "PolicyName": "root",
+                "PolicyDocument": {
+                  "Version": "2012-10-17",
+                  "Statement": [
+                    {
+                      "Action": [
+                        "logs:CreateLogGroup",
+                        "logs:CreateLogStream",
+                        "logs:PutLogEvents"
+                      ],
+                      "Resource": "arn:aws:logs:*:*:*",
+                      "Effect": "Allow"
+                    },
+                    {
+                      "Effect" : "Allow",
+                      "Action" : "*",
+                      "Resource": { 
+                        "Fn::Sub": [ "arn:aws:dynamodb:${Region}:${Account}:table/${TableName}", 
+                            { 
+                                "Region": { "Ref" : "AWS::Region" }, 
+                                "Account": { "Ref" : "AWS::AccountId" }, 
+                                "TableName" : { "Ref" : "DynamoDBTable" }
+                            } 
+                        ] }
+                    },
+                    {
+                      "Effect":"Allow",
+                      "Action":[ 
+                        "ec2:CreateNetworkInterface",
+                        "ec2:DescribeNetworkInterfaces",
+                        "ec2:DeleteNetworkInterface"
+                      ],
+                      "Resource": [ 
+                        "*"
+                      ]
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        }
+    },
+    "Outputs" : {
+        "TableName" : {
+            "Description" : "The name of the created bucket",
+            "Value" : { "Ref" : "DynamoDBTable" }
+        }, 
+        "Lambda" : {
+            "Description" : "The name of the lambda function",
+            "Value" : { "Ref" : "LambdaDDBWrite" }
+        },
+    	"VPC" : {
+    		"Description" : "VPC Name",
+    		"Value" : { "Ref" : "VPC" }
+    	}
+    }
+}
